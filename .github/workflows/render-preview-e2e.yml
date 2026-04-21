@@ -1,0 +1,314 @@
+# .github/workflows/render-preview-e2e.yml
+#
+# Runs Autonoma E2E tests against a Render Pull Request preview on every PR.
+#
+# Flow:
+#   1. Post a `pending` Commit Status to GitHub on the PR's HEAD SHA.
+#   2. Poll the Render API for a deploy of the parent service on this PR's branch.
+#   3. Once `status == live`, grab the preview service URL from the API.
+#   4. Optionally inject Basic Auth credentials into the URL.
+#   5. Kick off an Autonoma test run against the preview URL.
+#   6. Poll Autonoma until the run finishes.
+#   7. Post a final `success` or `failure` Commit Status linking to Autonoma.
+#
+# Required GitHub Actions secrets:
+#   RENDER_API_KEY       - Render API key (Bearer auth).
+#   RENDER_SERVICE_ID    - The parent web service ID (e.g. srv-xxxxxxxxxxxx).
+#   AUTONOMA_API_KEY     - Autonoma API key from https://getautonoma.com.
+# Optional (only if your Render previews are password-protected):
+#   RENDER_PREVIEW_USER  - Basic Auth username for the preview.
+#   RENDER_PREVIEW_PASS  - Basic Auth password for the preview.
+
+name: Render Preview E2E (Autonoma)
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+# Let GitHub Actions write Commit Statuses on behalf of the workflow.
+permissions:
+  contents: read
+  statuses: write
+  pull-requests: read
+
+# If a new commit lands on the same PR, cancel the in-flight run.
+concurrency:
+  group: render-preview-e2e-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  e2e:
+    name: E2E against Render preview
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    env:
+      # The PR's HEAD SHA — this is the commit the status attaches to.
+      HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      # The PR's source branch name — Render uses this to identify the preview.
+      BRANCH: ${{ github.head_ref }}
+      # Context string shown next to the status in the GitHub UI.
+      STATUS_CONTEXT: "autonoma/e2e"
+
+    steps:
+      # -----------------------------------------------------------------------
+      # 1. Post a pending Commit Status so reviewers see the check is running.
+      # -----------------------------------------------------------------------
+      - name: Mark commit status as pending
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh api \
+            --method POST \
+            -H "Accept: application/vnd.github+json" \
+            "/repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
+            -f state=pending \
+            -f context="${STATUS_CONTEXT}" \
+            -f description="Waiting for Render preview to become live..."
+
+      # -----------------------------------------------------------------------
+      # 2. Poll the Render API for a `live` deploy on this PR's branch.
+      #    Render exposes deploys on the PARENT service; we filter client-side
+      #    by branch name because the API does not filter by PR directly.
+      #    Timeout: 20 minutes. Interval: 30 seconds.
+      # -----------------------------------------------------------------------
+      - name: Wait for Render preview to go live
+        id: render
+        env:
+          RENDER_API_KEY: ${{ secrets.RENDER_API_KEY }}
+          RENDER_SERVICE_ID: ${{ secrets.RENDER_SERVICE_ID }}
+        run: |
+          set -euo pipefail
+
+          DEADLINE=$(( $(date +%s) + 20*60 ))   # 20-minute overall timeout
+          INTERVAL=30                            # seconds between polls
+
+          PREVIEW_URL=""
+          PREVIEW_SERVICE_ID=""
+
+          while :; do
+            # List deploys for the parent service. Render returns an array of
+            # { deploy: { id, status, trigger, commit, ... } } envelopes.
+            DEPLOYS_JSON=$(curl -sS --fail \
+              -H "Authorization: Bearer ${RENDER_API_KEY}" \
+              -H "Accept: application/json" \
+              "https://api.render.com/v1/services/${RENDER_SERVICE_ID}/deploys?limit=50")
+
+            # Find the most recent deploy whose branch matches this PR.
+            # Render includes the branch name under `commit.branch` or `trigger`.
+            LATEST=$(echo "${DEPLOYS_JSON}" | jq -r --arg br "${BRANCH}" '
+              [ .[] | select(.deploy.commit.branch == $br) ]
+              | sort_by(.deploy.createdAt) | reverse | .[0] // empty
+            ')
+
+            if [ -z "${LATEST}" ] || [ "${LATEST}" = "null" ]; then
+              echo "No deploy found yet for branch ${BRANCH}. Waiting..."
+            else
+              STATUS=$(echo "${LATEST}" | jq -r '.deploy.status')
+              echo "Latest deploy status for ${BRANCH}: ${STATUS}"
+
+              case "${STATUS}" in
+                live)
+                  # Ask the API which SERVICE (the preview, not the parent)
+                  # this deploy belongs to, then fetch its URL.
+                  PREVIEW_SERVICE_ID=$(echo "${LATEST}" | jq -r '.deploy.serviceId // empty')
+                  if [ -z "${PREVIEW_SERVICE_ID}" ]; then
+                    PREVIEW_SERVICE_ID="${RENDER_SERVICE_ID}"
+                  fi
+
+                  SERVICE_JSON=$(curl -sS --fail \
+                    -H "Authorization: Bearer ${RENDER_API_KEY}" \
+                    -H "Accept: application/json" \
+                    "https://api.render.com/v1/services/${PREVIEW_SERVICE_ID}")
+
+                  # The service URL is usually at `.serviceDetails.url` for web services.
+                  PREVIEW_URL=$(echo "${SERVICE_JSON}" | jq -r '
+                    .serviceDetails.url
+                    // .service.serviceDetails.url
+                    // .url
+                    // empty
+                  ')
+
+                  if [ -z "${PREVIEW_URL}" ]; then
+                    echo "Deploy is live but no URL returned for service ${PREVIEW_SERVICE_ID}." >&2
+                    exit 1
+                  fi
+
+                  echo "Preview is live: ${PREVIEW_URL}"
+                  break
+                  ;;
+                build_failed|update_failed|deactivated|canceled)
+                  echo "Render deploy ended with status=${STATUS}. Failing the check." >&2
+                  echo "render_status=${STATUS}" >> "${GITHUB_OUTPUT}"
+                  exit 1
+                  ;;
+                *)
+                  # created / build_in_progress / update_in_progress / pre_deploy_in_progress
+                  echo "Still deploying (${STATUS}). Sleeping ${INTERVAL}s..."
+                  ;;
+              esac
+            fi
+
+            if [ "$(date +%s)" -ge "${DEADLINE}" ]; then
+              echo "Timed out after 20 minutes waiting for Render preview on ${BRANCH}." >&2
+              exit 1
+            fi
+            sleep "${INTERVAL}"
+          done
+
+          echo "preview_url=${PREVIEW_URL}" >> "${GITHUB_OUTPUT}"
+          echo "preview_service_id=${PREVIEW_SERVICE_ID}" >> "${GITHUB_OUTPUT}"
+
+      # -----------------------------------------------------------------------
+      # 3. Inject Basic Auth into the URL if the preview is password-protected.
+      #    Result: https://user:pass@host/path
+      # -----------------------------------------------------------------------
+      - name: Inject Basic Auth credentials (optional)
+        id: target
+        env:
+          PREVIEW_URL: ${{ steps.render.outputs.preview_url }}
+          PREVIEW_USER: ${{ secrets.RENDER_PREVIEW_USER }}
+          PREVIEW_PASS: ${{ secrets.RENDER_PREVIEW_PASS }}
+        run: |
+          set -euo pipefail
+
+          if [ -n "${PREVIEW_USER:-}" ] && [ -n "${PREVIEW_PASS:-}" ]; then
+            # URL-encode the credentials defensively in case they contain special chars.
+            ENC_USER=$(jq -rn --arg v "${PREVIEW_USER}" '$v|@uri')
+            ENC_PASS=$(jq -rn --arg v "${PREVIEW_PASS}" '$v|@uri')
+            # Split scheme + rest and reassemble with credentials.
+            SCHEME="${PREVIEW_URL%%://*}"
+            REST="${PREVIEW_URL#*://}"
+            TARGET_URL="${SCHEME}://${ENC_USER}:${ENC_PASS}@${REST}"
+            echo "Injected Basic Auth into preview URL."
+          else
+            TARGET_URL="${PREVIEW_URL}"
+            echo "No Basic Auth configured; using preview URL as-is."
+          fi
+
+          # Mask it so it doesn't show up in logs.
+          echo "::add-mask::${TARGET_URL}"
+          echo "target_url=${TARGET_URL}" >> "${GITHUB_OUTPUT}"
+
+      # -----------------------------------------------------------------------
+      # 4. Kick off an Autonoma test run against the preview URL.
+      # -----------------------------------------------------------------------
+      - name: Start Autonoma test run
+        id: autonoma_start
+        env:
+          AUTONOMA_API_KEY: ${{ secrets.AUTONOMA_API_KEY }}
+          TARGET_URL: ${{ steps.target.outputs.target_url }}
+        run: |
+          set -euo pipefail
+
+          RESP=$(curl -sS --fail \
+            -X POST "https://api.getautonoma.com/v1/test-runs" \
+            -H "Authorization: Bearer ${AUTONOMA_API_KEY}" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -n \
+              --arg url  "${TARGET_URL}" \
+              --arg sha  "${HEAD_SHA}" \
+              --arg repo "${GITHUB_REPOSITORY}" \
+              --arg pr   "${{ github.event.pull_request.number }}" \
+              '{
+                targetUrl: $url,
+                metadata: { repo: $repo, pr: $pr, sha: $sha, source: "github-actions-render" }
+              }')")
+
+          RUN_ID=$(echo "${RESP}" | jq -r '.id // .runId // empty')
+          RUN_URL=$(echo "${RESP}" | jq -r '.url // .detailsUrl // empty')
+
+          if [ -z "${RUN_ID}" ]; then
+            echo "Autonoma did not return a run id. Response:" >&2
+            echo "${RESP}" >&2
+            exit 1
+          fi
+
+          echo "Autonoma run started: ${RUN_ID} (${RUN_URL})"
+          echo "run_id=${RUN_ID}"   >> "${GITHUB_OUTPUT}"
+          echo "run_url=${RUN_URL}" >> "${GITHUB_OUTPUT}"
+
+      # -----------------------------------------------------------------------
+      # 5. Poll Autonoma for completion. Succeeds only when the run passes.
+      # -----------------------------------------------------------------------
+      - name: Wait for Autonoma run to finish
+        id: autonoma_wait
+        env:
+          AUTONOMA_API_KEY: ${{ secrets.AUTONOMA_API_KEY }}
+          RUN_ID: ${{ steps.autonoma_start.outputs.run_id }}
+        run: |
+          set -euo pipefail
+
+          DEADLINE=$(( $(date +%s) + 25*60 ))   # hard 25-minute cap
+          INTERVAL=15
+
+          while :; do
+            RESP=$(curl -sS --fail \
+              -H "Authorization: Bearer ${AUTONOMA_API_KEY}" \
+              -H "Accept: application/json" \
+              "https://api.getautonoma.com/v1/test-runs/${RUN_ID}")
+
+            STATUS=$(echo "${RESP}" | jq -r '.status')
+            echo "Autonoma run ${RUN_ID} status: ${STATUS}"
+
+            case "${STATUS}" in
+              passed|succeeded|success)
+                echo "run_status=passed" >> "${GITHUB_OUTPUT}"
+                exit 0
+                ;;
+              failed|error|errored)
+                echo "run_status=failed" >> "${GITHUB_OUTPUT}"
+                exit 1
+                ;;
+              queued|running|pending|in_progress)
+                : # keep polling
+                ;;
+              *)
+                echo "Unknown Autonoma status: ${STATUS}. Continuing to poll." >&2
+                ;;
+            esac
+
+            if [ "$(date +%s)" -ge "${DEADLINE}" ]; then
+              echo "Timed out waiting for Autonoma run ${RUN_ID}." >&2
+              echo "run_status=timeout" >> "${GITHUB_OUTPUT}"
+              exit 1
+            fi
+            sleep "${INTERVAL}"
+          done
+
+      # -----------------------------------------------------------------------
+      # 6. Post the final Commit Status. Runs on success AND on failure so the
+      #    PR always ends with a definitive green/red check.
+      # -----------------------------------------------------------------------
+      - name: Report final commit status
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_URL: ${{ steps.autonoma_start.outputs.run_url }}
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          set -euo pipefail
+
+          # GitHub only accepts: success | failure | error | pending
+          case "${JOB_STATUS}" in
+            success)   STATE="success"; DESC="Autonoma E2E passed against Render preview" ;;
+            failure)   STATE="failure"; DESC="Autonoma E2E failed against Render preview" ;;
+            cancelled) STATE="error";   DESC="Autonoma E2E cancelled" ;;
+            *)         STATE="error";   DESC="Autonoma E2E errored" ;;
+          esac
+
+          # details_url must be an absolute http(s) URL or the API rejects it.
+          DETAILS_URL="${RUN_URL}"
+          if [ -z "${DETAILS_URL}" ]; then
+            DETAILS_URL="https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          fi
+
+          gh api \
+            --method POST \
+            -H "Accept: application/vnd.github+json" \
+            "/repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
+            -f state="${STATE}" \
+            -f context="${STATUS_CONTEXT}" \
+            -f description="${DESC}" \
+            -f target_url="${DETAILS_URL}"

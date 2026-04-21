@@ -1,0 +1,82 @@
+# render.yaml — Render Blueprint with Pull Request Previews enabled.
+#
+# Drop this file at the root of your repository, push to GitHub/GitLab,
+# then in the Render dashboard: New > Blueprint > select this repo.
+# Render will create the services below and automatically spin up a
+# preview environment for every new pull request.
+#
+# Docs: https://render.com/docs/blueprint-spec and
+#       https://render.com/docs/preview-environments
+
+# Top-level `previews` block controls PR preview behavior for the whole Blueprint.
+# Use `generation: automatic` (the current schema). The older boolean
+# `previewsEnabled: true` field on each service is deprecated — prefer this.
+previews:
+  # `automatic`  -> a preview environment is created for every new PR.
+  # `manual`     -> previews exist but you trigger them yourself from the dashboard.
+  # `off`        -> disable previews entirely for this Blueprint.
+  generation: automatic
+  # Automatically tear previews down after N days of PR inactivity so
+  # you don't pay for stale environments. Render's default is 7 days.
+  expireAfterDays: 7
+
+services:
+  # ---------------------------------------------------------------------------
+  # Web service — the app that gets a preview per PR.
+  # ---------------------------------------------------------------------------
+  - type: web
+    name: example-web
+    runtime: node
+    plan: starter
+    # Region must match any service this one depends on (e.g. the database).
+    region: oregon
+    # Production branch. PRs targeting this branch get preview environments.
+    branch: main
+    buildCommand: npm ci && npm run build
+    startCommand: npm start
+    # Optional: require Basic Auth on previews so they aren't publicly crawlable.
+    # Render exposes these via the dashboard; see the Preview Environments docs.
+    # previews:
+    #   plan: starter
+    envVars:
+      # Production value is set directly; previews inherit it unless overridden.
+      - key: NODE_ENV
+        value: production
+
+      # Per-preview override: `previewValue` is the value used ONLY in PR previews.
+      # Production keeps `value`, previews get `previewValue`. This is the
+      # cleanest way to point previews at a shared staging API, a feature
+      # flag provider's preview project, or a staging database.
+      - key: APP_ENV
+        value: production
+        previewValue: preview
+
+      # Point previews at a dedicated preview/staging Postgres instead of the
+      # production database defined below. Render does NOT auto-provision
+      # databases for previews — you must provide a DATABASE_URL yourself.
+      # Store the staging connection string as a secret in the dashboard or
+      # in a Render environment group, and reference it here.
+      - key: DATABASE_URL
+        fromDatabase:
+          name: example-db
+          property: connectionString
+        # Override the value for preview environments only.
+        # Replace the string below with your actual shared preview DB URL,
+        # or load it from a Render Environment Group via `fromGroup`.
+        previewValue: postgres://preview_user:preview_pass@preview-db.example.com:5432/preview
+
+      # Example of a secret that should NEVER exist in previews: set
+      # `previewValue` to a harmless placeholder so no real key leaks.
+      - key: STRIPE_SECRET_KEY
+        sync: false          # never auto-synced from repo; set in dashboard.
+        previewValue: sk_test_placeholder_for_previews
+
+# -----------------------------------------------------------------------------
+# Managed Postgres — production database. This is NOT copied into previews.
+# Previews reuse the `previewValue` DATABASE_URL defined above instead.
+# -----------------------------------------------------------------------------
+databases:
+  - name: example-db
+    plan: basic-256mb
+    region: oregon
+    postgresMajorVersion: "16"
